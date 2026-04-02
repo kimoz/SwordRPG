@@ -154,6 +154,35 @@ let gameState = {
     permanentProbBonus: 0
 };
 
+// --- Firebase Initialization ---
+let database = null;
+let rankingListener = null;
+
+function initFirebase() {
+    if (typeof firebase === "undefined" || !firebaseConfig || firebaseConfig.apiKey === "YOUR_API_KEY") {
+        console.warn("Firebase not configured. Using local mode.");
+        return;
+    }
+    try {
+        firebase.initializeApp(firebaseConfig);
+        database = firebase.database();
+        console.log("Firebase Connected: Local runner data ready to sync.");
+    } catch (e) {
+        console.error("Firebase Init Error:", e);
+    }
+}
+
+function updateServerScore() {
+    if (!database || !gameState.squadCode) return;
+    const path = `squads/${gameState.squadCode}/${gameState.playerName.replace(/\./g, '_')}`;
+    database.ref(path).set({
+        name: gameState.playerName,
+        level: gameState.currentLevel,
+        credits: gameState.credits,
+        lastUpdated: Date.now()
+    }).catch(e => console.warn("Score Sync Error:", e));
+}
+
 const ACHIEVEMENTS_DATA = [];
 
 function generateAchievements() {
@@ -268,8 +297,12 @@ const elBtnHack = document.getElementById('btn-hack');
 
 function init() {
     loadGame();
+    initFirebase();
     updateUI();
     addLog("시스템 초기화 완료. 그리드에 접속 중...", "system");
+    
+    // Auto-sync initial state to server if squad is joined
+    if (gameState.squadCode) updateServerScore();
 }
 
 function updateUI() {
@@ -451,6 +484,7 @@ async function enhanceBlade() {
         addLog(`[성공] ${currentWeapon.name} 가 ${gameState.currentLevel} 레벨로 강화되었습니다.`, "success");
         addLog(`> ${getEpicQuote('SUCCESS')}`, "system");
         triggerEffect('flash-success');
+        updateServerScore();
     } else if (randomVal < successProb + currentProb.maintain) {
         gameState.pityStack++; 
         addLog(`[유지] 강화에 실패했지만 레벨이 유지되었습니다. (스택 +1)`, "fail");
@@ -500,6 +534,7 @@ function mutateWeapon() {
     
     addLog(`[변이] 새로운 무기 '${newWeapon.name}' 을(를) 획득했습니다!`, "success");
     triggerEffect('flash-destroy');
+    updateServerScore();
 }
 
 function triggerEffect(className) {
@@ -527,6 +562,7 @@ async function hackData() {
     addLog(`[성공] 데이터 뱅크를 해킹했습니다. ${reward.toLocaleString()}₵를 획득했습니다.`, "success");
     addLog("해당 구역의 보안이 강화되었습니다. 내일 다시 시도하십시오.", "system");
     saveGame();
+    updateServerScore();
     updateUI();
 }
 
@@ -554,6 +590,7 @@ function changePlayerName() {
         addLog(`식별명이 '${gameState.playerName}'(으)로 변경되었습니다.`, "system");
         saveGame();
         updateUI();
+        updateServerScore();
     }
 }
 
@@ -569,6 +606,7 @@ function openSquadEntry() {
         }
         saveGame();
         updateUI();
+        updateServerScore();
     }
 }
 
@@ -595,30 +633,43 @@ function openRankingModal() {
     if (!overlay || !list) return;
 
     const squad = gameState.squadCode || "SOLO";
-    subtitle.innerText = `${squad} 구역 순위 데이터`;
-
-    // Mock data based on squad code to feel "alive"
-    const mockRunners = [
-        { name: "ACE_STRIKER", level: 18, credits: 5000000 },
-        { name: "NEON_GHOST", level: 15, credits: 2400000 },
-        { name: "VOID_WALKER", level: 12, credits: 1100000 },
-        { name: "DATA_MINER", level: 10, credits: 850000 }
-    ];
-    
-    // Add player to the list
-    const myData = { name: gameState.playerName, level: gameState.currentLevel, credits: gameState.credits, isMe: true };
-    const allData = [...mockRunners, myData].sort((a, b) => b.level - a.level || b.credits - a.credits);
-
-    list.innerHTML = allData.map((r, i) => `
-        <div class="ranking-row ${r.isMe ? 'me' : ''}">
-            <span class="rank-num">#${i+1}</span>
-            <span class="rank-name" style="flex-grow: 1;">${r.name}</span>
-            <span class="rank-score" style="color: var(--neon-blue);">+${r.level} Lv</span>
-        </div>
-    `).join('');
+    subtitle.innerText = `${squad} 구역 실시간 데이터`;
+    list.innerHTML = `<div class="ranking-row"><span style="color: var(--neon-blue);">그리드 데이터 검색 중...</span></div>`;
 
     overlay.classList.remove('hidden');
     overlay.style.display = 'flex';
+
+    if (!database || !gameState.squadCode) {
+        list.innerHTML = `<div class="ranking-row"><span style="color: #666;">스쿼드에 참여해야 실시간 순위를 볼 수 있습니다.</span></div>`;
+        return;
+    }
+
+    // Remove existing listener if any
+    if (rankingListener) {
+        database.ref(`squads/${gameState.squadCode}`).off('value', rankingListener);
+    }
+
+    // Set up live listener
+    rankingListener = database.ref(`squads/${gameState.squadCode}`).on('value', snapshot => {
+        const data = snapshot.val();
+        if (!data) {
+            list.innerHTML = `<div class="ranking-row"><span style="color: #666;">해당 스쿼드에 데이터가 없습니다.</span></div>`;
+            return;
+        }
+
+        const runners = Object.values(data);
+        const sorted = runners.sort((a, b) => b.level - a.level || b.credits - a.credits);
+
+        list.innerHTML = sorted.map((r, i) => `
+            <div class="ranking-row ${r.name === gameState.playerName ? 'me' : ''}">
+                <span class="rank-num">#${i+1}</span>
+                <span class="rank-name" style="flex-grow: 1;">${r.name}</span>
+                <span class="rank-score" style="color: var(--neon-blue);">+${r.level} Lv</span>
+            </div>
+        `).join('');
+    }, e => {
+        list.innerHTML = `<div class="ranking-row"><span style="color: var(--neon-pink);">에러: 연결 실패</span></div>`;
+    });
 }
 
 function openShareCard() {
@@ -693,6 +744,7 @@ function sellWeapon() {
     addLog(`[지급] 기본 등급의 새로운 무기를 지급받았습니다.`, "system");
     saveGame();
     updateUI();
+    updateServerScore();
 }
 
 let currentAchCategory = 'all';
@@ -908,7 +960,14 @@ const elBtnCopyInvite = document.getElementById('btn-copy-invite');
 if (elBtnCopyInvite) elBtnCopyInvite.addEventListener('click', copyInviteCode);
 
 const elBtnCloseRanking = document.getElementById('btn-close-ranking');
-if (elBtnCloseRanking) elBtnCloseRanking.addEventListener('click', () => { document.getElementById('ranking-overlay').classList.add('hidden'); document.getElementById('ranking-overlay').style.display='none'; });
+if (elBtnCloseRanking) elBtnCloseRanking.addEventListener('click', () => { 
+    document.getElementById('ranking-overlay').classList.add('hidden'); 
+    document.getElementById('ranking-overlay').style.display='none'; 
+    if (rankingListener && database && gameState.squadCode) {
+        database.ref(`squads/${gameState.squadCode}`).off('value', rankingListener);
+        rankingListener = null;
+    }
+});
 
 const elBtnCloseShare = document.getElementById('btn-close-share');
 if (elBtnCloseShare) elBtnCloseShare.addEventListener('click', () => { document.getElementById('share-card-overlay').classList.add('hidden'); document.getElementById('share-card-overlay').style.display='none'; });
